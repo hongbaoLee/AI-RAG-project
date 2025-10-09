@@ -1,0 +1,7 @@
+by Kevin Lee
+HFace_Embedding_Test目录下文件为测试用文件，不用于工程应用。目的是测试在线和本地使用Huggingface进行Embedding
+
+HF_down_from_mirror.py  从HuggingFace镜像网站下载Huggingface到本地models目录
+HF_Local_embedding.py  测试下载到本地Huggingface是否可用
+HF_Online_Embedding_Langchain.py  使用langchain封装的huggingface包，利用镜像网站做embedding
+HF_Online_Embedding_st.py  使用Huggingface自己的sentence_transformers包，利用镜像网站做embedding

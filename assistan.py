@@ -1,5 +1,5 @@
 import streamlit as st
-from Enterprise_rules_AI import ask_company_rules, collection, load_pdf_to_vector_db, PDF_PATH
+from Enterprise_rules_ALLi import ask_company_rules, collection, load_pdf_to_vector_db, PDF_PATH
 
 
 # 设置页面标题和图标

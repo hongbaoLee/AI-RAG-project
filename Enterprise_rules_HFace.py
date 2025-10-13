@@ -14,7 +14,7 @@ from sentence_transformers import SentenceTransformer
 # ==================== 配置区（请修改这里）====================
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 仍用于 Qwen
 CURRENT_DIR = Path(__file__).parent.absolute()
-PDF_PATH = os.path.join(CURRENT_DIR, "exercise2024.pdf")
+PDF_PATH = os.path.join(CURRENT_DIR, "rules_no_tables.pdf")
 QWEN_MODEL = "qwen3-max"
 # EMBEDDING_MODEL = "text-embedding-v1"  # ← 不再使用，已注释
 

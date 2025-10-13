@@ -11,7 +11,7 @@ from dashscope import TextEmbedding, Generation
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")           # ← 替换为你的 API Key
 #动态获取路径，获取当前文件所在目录
 CURRENT_DIR = Path(__file__).parent.absolute()
-PDF_PATH = os.path.join(CURRENT_DIR, "exercise2024.pdf" )                         # ← 替换为你的 PDF 文件路径
+PDF_PATH = os.path.join(CURRENT_DIR, "rules_no_tables.pdf" )                         # ← 替换为你的 PDF 文件路径
 QWEN_MODEL = "qwen3-max"                         # 可选: qwen-plus, qwen-turbo
 EMBEDDING_MODEL = "text-embedding-v1"           # 阿里云集成Embedding工具，推荐使用 v1 或 v2
 CHROMA_DB_PATH = "./chroma_db_company"          # 本地数据库保存路径

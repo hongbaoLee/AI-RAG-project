@@ -24,6 +24,8 @@ import pytesseract
 from PIL import Image
 
 # Configurations
+DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 用于 Qwen
+QWEN_MODEL = "qwen3-max"
 CHROMA_DB_DIR = "./chroma_db_corp"
 EMBEDDING_MODEL_NAME = "./models/st_paraphrase-multilingual-MiniLM-L12-v2"  # Use local path
 
@@ -137,23 +139,24 @@ def rag_query(query: str, top_k=5):
     )
     docs = db.similarity_search(query, k=top_k)
     context = "\n".join([doc.page_content for doc in docs])
-    # Call Qwen-max LLM via DashScope
-    prompt = f"请根据以下内容回答问题：\n\n内容：\n{context}\n\n问题：{query}\n答案："
-    dashscope.api_key = os.getenv("DASHSCOPE_API_KEY")
+    # Use messages for Qwen3
+    prompt = f"根据以下内容回答问题：\n\n{context}\n\n问题：{query}\n答案："
+    messages = [
+        {"role": "system", "content": "你是一个企业知识问答助手，回答要简洁准确。"},
+        {"role": "user", "content": prompt}
+    ]
     response = Generation.call(
-        model="qwen-max",
-        prompt=prompt,
+        api_key=os.getenv("DASHSCOPE_API_KEY"),
+        model="qwen3-max",
+        messages=messages,
+        result_format="message",
         top_p=0.8,
         temperature=0.3,
         max_tokens=256
     )
-    if response.status_code != 200:
-        raise Exception(f"❌ LLM 调用失败: {response.status_code} {response.message}") 
-    else:
-        print("✅ LLM 调用成功")
-        # Extract answer from response
-        answer = response['output']['text'] if 'output' in response and 'text' in response['output'] else str(response)
-        return answer
+    # Extract answer
+    answer = response.output.choices[0].message.content
+    return answer
 
 if __name__ == "__main__":
     # Step 1: Build corpus and save to ChromaDB

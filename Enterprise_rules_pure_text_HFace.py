@@ -1,3 +1,8 @@
+# Enterprise_rules_HFace.py
+# 目标：基于 DashScope 的 Qwen 大模型和本地 HuggingFace Embedding，实现企业制度问答系统
+# 支持从 纯文本PDF文件（不含图表） 提取文本，存入本地 ChromaDB 向量数据库
+# 支持中文问答，回答简洁准确
+
 import os
 from pathlib import Path
 import json

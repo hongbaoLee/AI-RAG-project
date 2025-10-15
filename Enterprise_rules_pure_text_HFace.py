@@ -41,15 +41,17 @@ def extract_text_from_pdf(pdf_path):
         text += page.extract_text() or ""
     return text
 
-def split_text(text, chunk_size=300, overlap=50):
-    words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start = end - overlap
+# 在段落、句子边界切分，语义更完整，适合 RAG
+def split_text(text, chunk_size=512, overlap=50):
+    if not text.strip():
+        return []
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""]
+    )
+    chunks = text_splitter.split_text(text)
     return [c.strip() for c in chunks if len(c.strip()) > 20]
 
 # ================== Step 2: 使用本地 HuggingFace 模型获取 Embedding ==================

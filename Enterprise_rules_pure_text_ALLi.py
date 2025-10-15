@@ -10,6 +10,8 @@ import chromadb
 from chromadb.utils import embedding_functions
 import dashscope
 from dashscope import TextEmbedding, Generation
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
 
 # ==================== 配置区（请修改这里）====================
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")           # ← 替换为你的 API Key
@@ -34,32 +36,41 @@ def extract_text_from_pdf(pdf_path):
         text += page.extract_text() or ""
     return text
 
-def split_text(text, chunk_size=300, overlap=50):
-    words = text.split()
-    chunks = []
-    start = 0
-    while start < len(words):
-        end = start + chunk_size
-        chunk = " ".join(words[start:end])
-        chunks.append(chunk)
-        start = end - overlap
+# 在段落、句子边界切分，语义更完整，适合 RAG
+def split_text(text, chunk_size=512, overlap=50):
+    if not text.strip():
+        return []
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=overlap,
+        separators=["\n\n", "\n", "。", "！", "？", "；", " ", ""]
+    )
+    chunks = text_splitter.split_text(text)
     return [c.strip() for c in chunks if len(c.strip()) > 20]
 
 # ================== Step 2: 调用阿里云获取 Embedding ==================
 def get_embedding(texts):
     if isinstance(texts, str):
-        texts = [texts]              # 把 texts 包装成一个单元素列表，以满足 embedding 函数 input 参数要求
+        texts = [texts]         # 把 texts 包装成一个单元素列表，以满足 embedding 函数 input 参数要求
+
+    # ⚠️ 添加长度检查（防御性编程）
+    for i, text in enumerate(texts):
+        if len(text) > 2000:
+            print(f"⚠️ 文本过长（{len(text)}字符），将被截断: {text[:50]}...")
+            texts[i] = text[:2000]  # 安全截断
+
     response = TextEmbedding.call(
         model=EMBEDDING_MODEL,
-        input=texts                  #embedding 接口要求输入是“文本列表”（list of strings），而不是单个字符串。
+        input=texts                    #embedding 接口要求输入是“文本列表”（list of strings），而不是单个字符串。
     )
+
     if response.status_code == 200:
-        # 修复：使用字典键访问，而非对象属性
+        # 正确提取 embeddings 列表
         embeddings = [d["embedding"] for d in response.output['embeddings']]
-        return embeddings[0] if len(embeddings) == 1 else embeddings
+        return embeddings[0] if len(embeddings) == 1 else embeddings  # ✅ 统一返回 list，调用方自行处理单/多条
     else:
         raise Exception(f"❌ Embedding 调用失败: {response.status_code} {response.message}")
-
 
 # ================== Step 3: 初始化 ChromaDB（使用远程 Embedding）==================
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)

@@ -122,14 +122,33 @@ def build_corpus_and_save(file_dir):
             docs.append(Document(page_content=table.to_csv(index=False), metadata={"source": file, "type": "table"}))
     # PDF
     for file in glob.glob(os.path.join(file_dir, "*.pdf")):
-        text, tables, images = extract_text_tables_images_from_pdf(file)
-        for chunk in splitter.split_text(text):
-            docs.append(Document(page_content=chunk, metadata={"source": file}))
-        # Save each PDF table to ChromaDB as well
-        for table in tables:
-            docs.append(Document(page_content=table.to_csv(index=False), metadata={"source": file, "type": "table"}))
-        # Images can be saved as base64 or file paths if needed
-    # MySQL part removed #
+        with pdfplumber.open(file) as pdf:
+            for i, page in enumerate(pdf.pages):
+                page_text, tables, images, ocr_texts = [], [], [], []
+                text = page.extract_text()
+                if text:
+                    page_text.append(text)
+                for table in page.extract_tables():
+                    tables.append(pd.DataFrame(table))
+                for img in page.images:
+                    cropped = page.within_bbox((img["x0"], img["top"], img["x1"], img["bottom"]))
+                    pil_img = cropped.to_image(resolution=300).original
+                    images.append(pil_img)
+                    ocr_result = pytesseract.image_to_string(pil_img, lang="chi_sim+eng")
+                    if ocr_result.strip():
+                        ocr_texts.append(ocr_result.strip())
+                # Combine normal text and OCR text
+                all_text = "\n".join(page_text + ocr_texts)
+                for chunk in splitter.split_text(all_text):
+                    docs.append(Document(
+                        page_content=chunk,
+                        metadata={"source": file, "page": i + 1}
+                    ))
+                for table in tables:
+                    docs.append(Document(
+                        page_content=table.to_csv(index=False),
+                        metadata={"source": file, "type": "table", "page": i + 1}
+                    ))
     save_to_chroma(docs)
 
 def rag_query(query: str, top_k=5):
@@ -154,9 +173,19 @@ def rag_query(query: str, top_k=5):
         temperature=0.3,
         max_tokens=256
     )
-    # Extract answer
     answer = response.output.choices[0].message.content
-    return answer
+
+    # Collect file and page info
+    refs = []
+    for doc in docs:
+        meta = doc.metadata
+        ref = f"{os.path.basename(meta.get('source', ''))}"
+        if 'page' in meta:
+            ref += f" (page {meta['page']})"
+        refs.append(ref)
+    refs = list(set(refs))  # Remove duplicates
+
+    return answer, refs
 
 if __name__ == "__main__":
     # Step 1: Build corpus and save to ChromaDB
@@ -168,5 +197,6 @@ if __name__ == "__main__":
         if question.strip().lower() == "quit":
             print("程序已退出。")
             break
-        answer = rag_query(question)
+        answer, refs = rag_query(question)
         print("Answer:", answer)
+        print("参考文件及页码:", "; ".join(refs))

@@ -22,6 +22,8 @@ from typing import List
 import pdfplumber
 import pytesseract
 from PIL import Image
+import chromadb
+from chromadb.config import Settings
 
 # Configurations
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")  # 用于 Qwen
@@ -105,6 +107,27 @@ def save_to_chroma(docs: List[Document]):
     )
 
 def build_corpus_and_save(file_dir):
+    # Clear existing documents in ChromaDB (keep DB files / collections)
+    try:
+        # 使用 PersistentClient
+        client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+
+        # 方法1：清空每个集合的数据（保留集合结构）
+        for collection in client.list_collections():
+            results = collection.get(include=[])
+            ids = results.get("ids", [])
+            if ids:
+                print(f"Deleting {len(ids)} items from '{collection.name}'")
+                collection.delete(ids=ids)
+
+        # 方法2（更彻底）：直接删除所有集合
+        # for collection in client.list_collections():
+        #     client.delete_collection(name=collection.name)
+        #     print(f"Collection '{collection.name}' deleted.")
+
+    except Exception as e:
+        print(f"Warning: failed to clear ChromaDB before build (continuing): {e}")
+    
     docs = []
     # DOCX
     for file in glob.glob(os.path.join(file_dir, "*.docx")):

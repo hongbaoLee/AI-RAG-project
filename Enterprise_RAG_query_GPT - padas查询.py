@@ -6,17 +6,6 @@
 # Make sure to install them via pip if not already installed.
 # Note: You need to have access to the Qwen-max model via DashScope API.
 # Set your DashScope API key in the environment variable DASHSCOPE_API_KEY.
-
-# MySQL数据库连接配置在MYSQL_CONFIG中，请根据实际情况修改。
-# Mysql数据库检索，采取SQLDatabase + Toolkit + LLM模式。用户问题中涉及数据库相关关键词时，触发SQL生成与查询。LLM把用户问题生成SQL，采用SQLDatabaseToolkit执行查询。
-# 将查询结果和文档内容一起传给LLM生成最终答案。
-# LLM部分使用DeepSeek模型，通过DashScope API调用。DeepSeek模型在SQL生成方面表现更好。
-# PDF文件使用pdfplumber进行文本提取，用openCV进行预处理，然后使用Tesseract进行图片识别。
-# Excel 表格新增每个sheet转为HTML存入ChromaDB的功能，方便查询时保留表格结构信息。极大提升了查询效果。
-# 增加了SQL语句出错重新生成机制，如果SQL执行报错，会将错误信息反馈给LLM，重新生成SQL并执行，直到成功为止。
-
-# 现在需要解决的是：1、大模型输出表格的问题，大模型由于自身限制，只输出长表格中的前面几行，导致答案不完整。
-# 2、用户问题的路由机制，如何准确判断用户问题是否涉及数据库查询，从而触发SQL生成与查询。
 #
 import os
 import glob
@@ -36,8 +25,9 @@ from chromadb.config import Settings
 import mysql.connector
 from sqlalchemy import create_engine
 
+# 最新 langchain_community 推荐用法
 from langchain_community.utilities import SQLDatabase
-from langchain_community.agent_toolkits.sql.base import SQLDatabaseToolkit
+from langchain_experimental.sql import SQLQuery
 from langchain_core.language_models.llms import LLM
 from typing import Optional, List
 from openai import OpenAI
@@ -56,10 +46,10 @@ MYSQL_CONFIG = {
     'database': 'prestige_db'
 }
 
+# 1. 启动时自动获取数据库表结构和样本数据
 def get_db_schema_info():
     conn = mysql.connector.connect(**MYSQL_CONFIG)
     cursor = conn.cursor()
-    # 1. 普通表结构
     cursor.execute("SHOW TABLES")
     tables = [row[0] for row in cursor.fetchall()]
     schema_info = []
@@ -67,33 +57,18 @@ def get_db_schema_info():
         cursor.execute(f"SHOW CREATE TABLE {table}")
         create_sql = cursor.fetchone()[1]
         schema_info.append(create_sql)
+        # 增加样本数据（如salary_month）
         if table == "salaries":
             cursor.execute("SELECT DISTINCT salary_month FROM salaries ORDER BY salary_month DESC LIMIT 5")
             months = [str(row[0]) for row in cursor.fetchall()]
             if months:
                 schema_info.append(f"{table}.salary_month 样本值: {', '.join(months)}")
-    # 2. 视图结构
-    cursor.execute("SHOW FULL TABLES WHERE Table_type = 'VIEW'")
-    views = [row[0] for row in cursor.fetchall()]
-    for view in views:
-        cursor.execute(f"SHOW CREATE VIEW {view}")
-        create_view = cursor.fetchone()[1]
-        schema_info.append(f"-- 视图 {view}:\n{create_view}")
-    # 3. 存储过程结构
-    cursor.execute("SHOW PROCEDURE STATUS WHERE Db = DATABASE()")
-    procedures = [row[1] for row in cursor.fetchall()]
-    for proc in procedures:
-        try:
-            cursor.execute(f"SHOW CREATE PROCEDURE {proc}")
-            proc_create = cursor.fetchone()[2]
-            schema_info.append(f"-- 存储过程 {proc}:\n{proc_create}")
-        except Exception as e:
-            schema_info.append(f"-- 存储过程 {proc}: 无法获取定义，错误: {e}")
     conn.close()
     return "\n\n".join(schema_info)
 
 DB_SCHEMA_INFO = get_db_schema_info()
 
+# 2. DeepSeek LLM wrapper for LangChain，强化prompt，要求优先用样本值
 class DeepSeekLLM(LLM):
     model: str = "deepseek-v3.2-exp"
     api_key: str = DASHSCOPE_API_KEY
@@ -109,9 +84,7 @@ class DeepSeekLLM(LLM):
             "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
             "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
             "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-            "如果涉及日期或月份，请优先使用样本值中的日期。"
-            "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-            "你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。\n"
+            "如果涉及日期或月份，请优先使用样本值中的日期。\n"
             + prompt
         )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
@@ -122,24 +95,20 @@ class DeepSeekLLM(LLM):
             stream=False
         )
         result = completion.choices[0].message.content.strip()
+        # 用正则提取SQL
         import re
         sql_match = re.search(r"select .*?;", result, re.IGNORECASE | re.DOTALL)
         if sql_match:
             return sql_match.group(0)
         return result
 
-# SQLDatabase + Toolkit 初始化
+# 3. SQLDatabase 初始化
 db_uri = f"mysql+mysqlconnector://{MYSQL_CONFIG['user']}:{MYSQL_CONFIG['password']}@{MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}"
 db = SQLDatabase.from_uri(db_uri)
 llm = DeepSeekLLM()
-toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-tools = toolkit.get_tools()
-query_tool = None
-for tool in tools:
-    if tool.name == "sql_db_query":
-        query_tool = tool
-        break
+sql_query_chain = SQLQuery(llm=llm, database=db)
 
+# 4. 文档RAG部分（不变）
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
@@ -221,27 +190,18 @@ def build_corpus_and_save(file_dir):
         print(f"Warning: failed to clear ChromaDB before build (continuing): {e}")
 
     docs = []
-    # DOCX处理
     for file in glob.glob(os.path.join(file_dir, "*.docx")):
         text = extract_text_from_docx(file)
         for chunk in splitter.split_text(text):
             docs.append(Document(page_content=chunk, metadata={"source": file}))
         for table in extract_tables_from_docx(file):
             docs.append(Document(page_content=table.to_csv(index=False), metadata={"source": file, "type": "table"}))
-    # XLSX处理（新增：每个sheet转为HTML）
     for file in glob.glob(os.path.join(file_dir, "*.xlsx")):
-        sheets = pd.read_excel(file, sheet_name=None, header=None)
-        for sheet_name, df in sheets.items():
-            if not df.empty:
-                html_str = df.to_html(index=False)
-                docs.append(Document(page_content=html_str, metadata={"source": file, "sheet": sheet_name, "type": "table_html"}))
-        # 兼容原有文本和csv分块（可保留/可删）
         text = extract_text_from_xlsx(file)
         for chunk in splitter.split_text(text):
             docs.append(Document(page_content=chunk, metadata={"source": file}))
         for table in extract_tables_from_xlsx(file):
             docs.append(Document(page_content=table.to_csv(index=False), metadata={"source": file, "type": "table"}))
-    # PDF处理
     for file in glob.glob(os.path.join(file_dir, "*.pdf")):
         text, tables, images = extract_text_tables_images_from_pdf(file)
         for chunk in splitter.split_text(text):
@@ -251,7 +211,9 @@ def build_corpus_and_save(file_dir):
                 docs.append(Document(page_content=str(table), metadata={"source": file, "type": "table"}))
     save_to_chroma(docs)
 
+# 5. 主问答逻辑
 def rag_query(question: str, top_k=5):
+    # 1. 文档RAG
     db_chroma = Chroma(
         persist_directory=CHROMA_DB_DIR,
         embedding_function=embeddings
@@ -259,50 +221,25 @@ def rag_query(question: str, top_k=5):
     docs = db_chroma.similarity_search(question, k=top_k)
     context = "\n".join([doc.page_content for doc in docs])
 
+    # 2. 判断是否需要数据库数据（可用关键词/正则/LLM）
     need_db = any(kw in question for kw in ["工资", "员工", "部门", "销售额", "奖金", "名单", "人数", "统计"])
-    db_answer = ""
-    sql_error = ""
-    if need_db and query_tool:
+    sql_result = ""
+    if need_db:
         try:
-            sql_prompt = (
-                f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
-                "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
-                "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
-                "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-                "如果涉及日期或月份，请优先使用样本值中的日期。"
-                "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-                "**你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。**\n"
-                f"问题：{question}"
-            )
-            sql_str = llm.invoke(sql_prompt)
-            print("生成的SQL:", sql_str)
-            db_answer = query_tool.invoke(sql_str)
-            context += f"\n\n[SQL查询结果]\n{db_answer}\n"
+            # SQLQueryChain自动生成SQL并执行，返回结构化结果
+            sql_result = sql_query_chain.run(question)
+            # 结果通常是结构化文本或markdown表格，LLM更容易理解
+            context += f"\n\n[SQL查询结果]\n{sql_result}\n"
         except Exception as e:
-            sql_error = str(e)
-            # 自动重试：把错误信息和表结构反馈给LLM
-            retry_prompt = (
-                f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
-                f"上一次SQL执行报错，错误信息如下：\n{sql_error}\n"
-                "请根据错误信息和表结构，重新生成正确的MySQL SQL语句。"
-                "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
-                "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-                "如果涉及日期或月份，请优先使用实际存在的日期字段。"
-                "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-                "**你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。**\n"
-                f"问题：{question}"
-            )
-            sql_str = llm.invoke(retry_prompt)
-            print("重试生成的SQL:", sql_str)
-            try:
-                db_answer = query_tool.invoke(sql_str)
-                context += f"\n\n[SQL查询结果]\n{db_answer}\n"
-            except Exception as e2:
-                context += f"\n\n[数据库查询出错]: {e2}"
+            context += f"\n\n[数据库查询出错]: {e}"
+
+    # 4. 用LLM生成最终答案
     prompt = (
         f"根据以下内容回答问题：\n\n{context}\n\n"
         f"问题：{question}\n"
-        "请优先引用[SQL查询结果]直接作答，如无再参考文档内容。"
+        "请严格优先引用[SQL查询结果]直接作答，不要忽略SQL查询结果。"
+        "如果SQL查询结果中有答案，直接引用该结果，不要编造。"
+        "如果SQL查询结果为空，再考虑参考文档内容。"
         "答案："
     )
     messages = [
@@ -331,7 +268,8 @@ def rag_query(question: str, top_k=5):
     return answer, refs
 
 if __name__ == "__main__":
-    build_corpus_and_save("./")  # 只在文档有变动时手动运行
+    build_corpus_and_save("./")  # Set your directory
+
     while True:
         question = input("请输入您的问题（输入 quit 退出）：")
         if question.strip().lower() == "quit":

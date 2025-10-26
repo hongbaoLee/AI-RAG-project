@@ -12,3 +12,5 @@ assistan.py 基于streamlit开发的支持opensssl的用户问答客户端，文
 从extract_text_from_PDF_with_tables.py的生成效果来看，chatGPT生成的代码质量比Qwen生成的代码质量好。
 
 Enterprise_RAG_query_GPT.py ChatGPT辅助生成的企业RAG知识库查询系统，可以将word文档、excel表格、含图表的PDF文档内容向量化以后存入ChromaDB，通过Qwen-max模型提供知识库检索功能。员工可查询公司的规章制度。
+
+主要可用文件：Enterprise_RAG_query_GPT.py

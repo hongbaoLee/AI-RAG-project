@@ -14,9 +14,12 @@
 # PDF文件使用pdfplumber进行文本提取，用openCV进行预处理，然后使用Tesseract进行图片识别。
 # Excel 表格新增每个sheet转为HTML存入ChromaDB的功能，方便查询时保留表格结构信息。极大提升了查询效果。
 # 增加了SQL语句出错重新生成机制，如果SQL执行报错，会将错误信息反馈给LLM，重新生成SQL并执行，直到成功为止。
+# 修改了rag_query函数的SQL生成错误的重试机制。 如果SQL执行报错，会将错误信息反馈给LLM，重新生成SQL并执行，可以设置重试次数。
 
-# 现在需要解决的是：1、大模型输出表格的问题，大模型由于自身限制，只输出长表格中的前面几行，导致答案不完整。
+# 现在需要解决的问题：
+# 1、大模型输出表格的问题，大模型由于自身限制，只输出长表格中的前面几行，导致答案不完整。
 # 2、用户问题的路由机制，如何准确判断用户问题是否涉及数据库查询，从而触发SQL生成与查询。
+# 3、上传新的制度文件后，文档增量更新。
 #
 import os
 import glob
@@ -26,25 +29,24 @@ import pandas as pd
 import pdfplumber
 import pytesseract
 from PIL import Image
+from typing import Optional, List
 from dashscope import Generation
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings                # 加载比较慢
 from langchain_chroma import Chroma
 from langchain.schema import Document
-from typing import List
 from chromadb.config import Settings
 import mysql.connector
 from sqlalchemy import create_engine
-
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits.sql.base import SQLDatabaseToolkit
 from langchain_core.language_models.llms import LLM
-from typing import Optional, List
 from openai import OpenAI
 
 # 配置
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 QWEN_MODEL = "qwen-max"
+TEXT_TO_SQL_MODEL = "glm-4.6"    # 用于SQL生成的LLM模型名称，可替换为"deepseek-v3.2-exp", "qwen3-coder-480b-a35b-instruct"等
 CHROMA_DB_DIR = "./chroma_db_corp"
 EMBEDDING_MODEL_NAME = "./models/st_paraphrase-multilingual-MiniLM-L12-v2"
 
@@ -72,48 +74,51 @@ def get_db_schema_info():
             months = [str(row[0]) for row in cursor.fetchall()]
             if months:
                 schema_info.append(f"{table}.salary_month 样本值: {', '.join(months)}")
-    # 2. 视图结构
-    cursor.execute("SHOW FULL TABLES WHERE Table_type = 'VIEW'")
-    views = [row[0] for row in cursor.fetchall()]
-    for view in views:
-        cursor.execute(f"SHOW CREATE VIEW {view}")
-        create_view = cursor.fetchone()[1]
-        schema_info.append(f"-- 视图 {view}:\n{create_view}")
-    # 3. 存储过程结构
-    cursor.execute("SHOW PROCEDURE STATUS WHERE Db = DATABASE()")
-    procedures = [row[1] for row in cursor.fetchall()]
-    for proc in procedures:
-        try:
-            cursor.execute(f"SHOW CREATE PROCEDURE {proc}")
-            proc_create = cursor.fetchone()[2]
-            schema_info.append(f"-- 存储过程 {proc}:\n{proc_create}")
-        except Exception as e:
-            schema_info.append(f"-- 存储过程 {proc}: 无法获取定义，错误: {e}")
+    # # 2. 视图结构
+    # cursor.execute("SHOW FULL TABLES WHERE Table_type = 'VIEW'")
+    # views = [row[0] for row in cursor.fetchall()]
+    # for view in views:
+    #     cursor.execute(f"SHOW CREATE VIEW {view}")
+    #     create_view = cursor.fetchone()[1]
+    #     schema_info.append(f"-- 视图 {view}:\n{create_view}")
+    # # 3. 存储过程结构
+    # cursor.execute("SHOW PROCEDURE STATUS WHERE Db = DATABASE()")
+    # procedures = [row[1] for row in cursor.fetchall()]
+    # for proc in procedures:
+    #     try:
+    #         cursor.execute(f"SHOW CREATE PROCEDURE {proc}")
+    #         proc_create = cursor.fetchone()[2]
+    #         schema_info.append(f"-- 存储过程 {proc}:\n{proc_create}")
+    #     except Exception as e:
+    #         schema_info.append(f"-- 存储过程 {proc}: 无法获取定义，错误: {e}")
     conn.close()
     return "\n\n".join(schema_info)
 
+
 DB_SCHEMA_INFO = get_db_schema_info()
 
-class DeepSeekLLM(LLM):
-    model: str = "deepseek-v3.2-exp"
+
+#定义用于SQL生成的LLM
+class Text_to_SQL_LLM(LLM):
+    model: str = TEXT_TO_SQL_MODEL # 用于SQL生成的LLM
     api_key: str = DASHSCOPE_API_KEY
     base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
     @property
     def _llm_type(self) -> str:
-        return "deepseek"
+        return TEXT_TO_SQL_MODEL
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-        prompt = (
-            f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
-            "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
-            "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
-            "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-            "如果涉及日期或月份，请优先使用样本值中的日期。"
-            "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-            "你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。\n"
-            + prompt
-        )
+        # prompt = (
+        #     f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
+        #     "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
+        #     "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
+        #     "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
+        #     "如果涉及日期或月份，请优先使用样本值中的日期。"
+        #     "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
+        #     "你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。\n"
+        #     + prompt
+        # )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         messages = [{"role": "user", "content": prompt}]
         completion = client.chat.completions.create(
@@ -131,7 +136,7 @@ class DeepSeekLLM(LLM):
 # SQLDatabase + Toolkit 初始化
 db_uri = f"mysql+mysqlconnector://{MYSQL_CONFIG['user']}:{MYSQL_CONFIG['password']}@{MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}"
 db = SQLDatabase.from_uri(db_uri)
-llm = DeepSeekLLM()
+llm = Text_to_SQL_LLM()
 toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 tools = toolkit.get_tools()
 query_tool = None
@@ -140,7 +145,7 @@ for tool in tools:
         query_tool = tool
         break
 
-embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)
+embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)       # 加载耗时
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 
 def extract_text_from_docx(file_path):
@@ -262,25 +267,29 @@ def rag_query(question: str, top_k=5):
     need_db = any(kw in question for kw in ["工资", "员工", "部门", "销售额", "奖金", "名单", "人数", "统计"])
     db_answer = ""
     sql_error = ""
+    max_retry = 1  # SQL生成出错，最多重试1次
+    retry_count = 0
     if need_db and query_tool:
-        try:
-            sql_prompt = (
-                f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
-                "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
-                "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
-                "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-                "如果涉及日期或月份，请优先使用样本值中的日期。"
-                "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-                "**你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。**\n"
-                f"问题：{question}"
-            )
-            sql_str = llm.invoke(sql_prompt)
-            print("生成的SQL:", sql_str)
-            db_answer = query_tool.invoke(sql_str)
-            context += f"\n\n[SQL查询结果]\n{db_answer}\n"
-        except Exception as e:
-            sql_error = str(e)
-            # 自动重试：把错误信息和表结构反馈给LLM
+        sql_prompt = (
+            f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
+            "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
+            "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
+            "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
+            "如果涉及日期或月份，请优先使用样本值中的日期。"
+            "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
+            "**你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。**\n"
+            f"问题：{question}"
+        )
+        sql_str = llm.invoke(sql_prompt)
+        print("生成的SQL:", sql_str)
+        db_answer = query_tool.invoke(sql_str)
+        while (
+            retry_count < max_retry and
+            isinstance(db_answer, str) and
+            ("error" in db_answer.lower() or "unknown column" in db_answer.lower())
+        ):
+            retry_count += 1
+            sql_error = db_answer
             retry_prompt = (
                 f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
                 f"上一次SQL执行报错，错误信息如下：\n{sql_error}\n"
@@ -294,11 +303,8 @@ def rag_query(question: str, top_k=5):
             )
             sql_str = llm.invoke(retry_prompt)
             print("重试生成的SQL:", sql_str)
-            try:
-                db_answer = query_tool.invoke(sql_str)
-                context += f"\n\n[SQL查询结果]\n{db_answer}\n"
-            except Exception as e2:
-                context += f"\n\n[数据库查询出错]: {e2}"
+            db_answer = query_tool.invoke(sql_str)
+        context += f"\n\n[SQL查询结果]\n{db_answer}\n"
     prompt = (
         f"根据以下内容回答问题：\n\n{context}\n\n"
         f"问题：{question}\n"
@@ -333,8 +339,8 @@ def rag_query(question: str, top_k=5):
 if __name__ == "__main__":
     build_corpus_and_save("./")  # 只在文档有变动时手动运行
     while True:
-        question = input("请输入您的问题（输入 quit 退出）：")
-        if question.strip().lower() == "quit":
+        question = input("请输入您的问题（输入 quit or exit 退出）：")
+        if question.strip().lower() == "quit" or question.strip().lower() == "exit":
             print("程序已退出。")
             break
         answer, refs = rag_query(question)

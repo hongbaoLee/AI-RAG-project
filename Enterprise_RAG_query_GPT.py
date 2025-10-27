@@ -16,10 +16,13 @@
 # 增加了SQL语句出错重新生成机制，如果SQL执行报错，会将错误信息反馈给LLM，重新生成SQL并执行，直到成功为止。
 # 修改了rag_query函数的SQL生成错误的重试机制。 如果SQL执行报错，会将错误信息反馈给LLM，重新生成SQL并执行，可以设置重试次数。
 
+# 修改了程序中数据库查询结果返回给用户的方式。将数据库查询结果直接格式化以后返回给用户，不再送给大模型生成答案，避免大模型输出表格不完整的问题。
+# 修改了数据库查询结果的格式化显示，使用tabulate库将结果以表格形式展示，提升可读性。
+# 改用Langchain的SQLDatabase进行数据库查询，返回结果类型为list of dict格式，方便tabulate格式化，   2025-10-27
+
 # 现在需要解决的问题：
-# 1、大模型输出表格的问题，大模型由于自身限制，只输出长表格中的前面几行，导致答案不完整。
-# 2、用户问题的路由机制，如何准确判断用户问题是否涉及数据库查询，从而触发SQL生成与查询。
-# 3、上传新的制度文件后，文档增量更新。
+# 1、用户问题的路由机制，如何准确判断用户问题是否涉及数据库查询，从而触发SQL生成与查询。
+# 2、上传新的制度文件后，文档增量更新。
 #
 import os
 import glob
@@ -40,8 +43,11 @@ import mysql.connector
 from sqlalchemy import create_engine
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits.sql.base import SQLDatabaseToolkit
+# from langchain.chains import SQLDatabaseChain
 from langchain_core.language_models.llms import LLM
 from openai import OpenAI
+import tabulate  # 新增，需 pip install tabulate
+import ast
 
 # 配置
 DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
@@ -109,16 +115,6 @@ class Text_to_SQL_LLM(LLM):
         return TEXT_TO_SQL_MODEL
 
     def _call(self, prompt: str, stop: Optional[List[str]] = None, **kwargs) -> str:
-        # prompt = (
-        #     f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
-        #     "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
-        #     "你必须只输出SQL语句，不要输出任何解释、代码块标记或其它内容。"
-        #     "不要输出```sql或```等代码块标记。不要加LIMIT限制，必须查询所有数据。"
-        #     "如果涉及日期或月份，请优先使用样本值中的日期。"
-        #     "如有视图（VIEW）或存储过程（PROCEDURE）可用，请优先使用视图或存储过程。"
-        #     "你必须严格使用表结构中实际存在的字段名，不要凭空创造字段。\n"
-        #     + prompt
-        # )
         client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         messages = [{"role": "user", "content": prompt}]
         completion = client.chat.completions.create(
@@ -137,13 +133,14 @@ class Text_to_SQL_LLM(LLM):
 db_uri = f"mysql+mysqlconnector://{MYSQL_CONFIG['user']}:{MYSQL_CONFIG['password']}@{MYSQL_CONFIG['host']}:{MYSQL_CONFIG['port']}/{MYSQL_CONFIG['database']}"
 db = SQLDatabase.from_uri(db_uri)
 llm = Text_to_SQL_LLM()
-toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-tools = toolkit.get_tools()
-query_tool = None
-for tool in tools:
-    if tool.name == "sql_db_query":
-        query_tool = tool
-        break
+# 改用SQLDatabaseChain方式执行SQL查询，返回类型为list of dict，方便后续格式化显示
+# toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+# tools = toolkit.get_tools()
+# query_tool = None
+# for tool in tools:
+#     if tool.name == "sql_db_query":
+#         query_tool = tool
+#         break
 
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL_NAME)       # 加载耗时
 splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
@@ -256,20 +253,32 @@ def build_corpus_and_save(file_dir):
                 docs.append(Document(page_content=str(table), metadata={"source": file, "type": "table"}))
     save_to_chroma(docs)
 
+def format_sql_result(result):
+    """只格式化多行，单行直接自然语言输出"""
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        if len(result) == 1:
+            # 只返回一行时，直接自然语言描述
+            row = result[0]
+            # 拼接成“产品xxx，销售额yyy”这样的描述
+            return "，".join([f"{k}: {v}" for k, v in row.items()])
+        else:
+            headers = result[0].keys()
+            table = [list(row.values()) for row in result]
+            return tabulate.tabulate(table, headers, tablefmt="grid", stralign="center", numalign="center")
+    return str(result)
+
 def rag_query(question: str, top_k=5):
     db_chroma = Chroma(
         persist_directory=CHROMA_DB_DIR,
         embedding_function=embeddings
     )
-    docs = db_chroma.similarity_search(question, k=top_k)
-    context = "\n".join([doc.page_content for doc in docs])
-
     need_db = any(kw in question for kw in ["工资", "员工", "部门", "销售额", "奖金", "名单", "人数", "统计"])
     db_answer = ""
     sql_error = ""
     max_retry = 1  # SQL生成出错，最多重试1次
     retry_count = 0
-    if need_db and query_tool:
+    # if need_db and query_tool:
+    if need_db:
         sql_prompt = (
             f"数据库表结构如下：\n{DB_SCHEMA_INFO}\n\n"
             "请根据表结构和样本值生成可以直接执行的MySQL SQL语句。"
@@ -282,7 +291,8 @@ def rag_query(question: str, top_k=5):
         )
         sql_str = llm.invoke(sql_prompt)
         print("生成的SQL:", sql_str)
-        db_answer = query_tool.invoke(sql_str)
+        # db_answer = query_tool.invoke(sql_str)
+        db_answer = db._execute(sql_str)
         while (
             retry_count < max_retry and
             isinstance(db_answer, str) and
@@ -303,38 +313,43 @@ def rag_query(question: str, top_k=5):
             )
             sql_str = llm.invoke(retry_prompt)
             print("重试生成的SQL:", sql_str)
-            db_answer = query_tool.invoke(sql_str)
-        context += f"\n\n[SQL查询结果]\n{db_answer}\n"
-    prompt = (
-        f"根据以下内容回答问题：\n\n{context}\n\n"
-        f"问题：{question}\n"
-        "请优先引用[SQL查询结果]直接作答，如无再参考文档内容。"
-        "答案："
-    )
-    messages = [
-        {"role": "system", "content": "你是一个企业知识问答助手，回答要简洁准确。"},
-        {"role": "user", "content": prompt}
-    ]
-    response = Generation.call(
-        api_key=DASHSCOPE_API_KEY,
-        model=QWEN_MODEL,
-        messages=messages,
-        result_format="message",
-        top_p=0.8,
-        temperature=0.3,
-        max_tokens=512
-    )
-    answer = response.output.choices[0].message.content
+            # db_answer = query_tool.invoke(sql_str)
+            db_answer = db._execute(sql_str)
 
-    refs = []
-    for doc in docs:
-        meta = doc.metadata
-        ref = f"{os.path.basename(meta.get('source', ''))}"
-        if 'page' in meta:
-            ref += f" (page {meta['page']})"
-        refs.append(ref)
-    refs = list(set(refs))
-    return answer, refs
+        # 只返回格式化SQL结果，不再拼接无关文档，也不送大模型
+        formatted = format_sql_result(db_answer)
+        return formatted, []
+    else:
+        docs = db_chroma.similarity_search(question, k=top_k)
+        context = "\n".join([doc.page_content for doc in docs])
+        prompt = (
+            f"根据以下内容回答问题：\n\n{context}\n\n"
+            f"问题：{question}\n"
+            "答案："
+        )
+        messages = [
+            {"role": "system", "content": "你是一个企业知识问答助手，回答要简洁准确。"},
+            {"role": "user", "content": prompt}
+        ]
+        response = Generation.call(
+            api_key=DASHSCOPE_API_KEY,
+            model=QWEN_MODEL,
+            messages=messages,
+            result_format="message",
+            top_p=0.8,
+            temperature=0.3,
+            max_tokens=512
+        )
+        answer = response.output.choices[0].message.content
+        refs = []
+        for doc in docs:
+            meta = doc.metadata
+            ref = f"{os.path.basename(meta.get('source', ''))}"
+            if 'page' in meta:
+                ref += f" (page {meta['page']})"
+            refs.append(ref)
+        refs = list(set(refs))
+        return answer, refs
 
 if __name__ == "__main__":
     build_corpus_and_save("./")  # 只在文档有变动时手动运行
@@ -345,4 +360,5 @@ if __name__ == "__main__":
             break
         answer, refs = rag_query(question)
         print("Answer:", answer)
-        print("参考文件及页码:", "; ".join(refs))
+        if refs:
+            print("参考文件及页码:", "; ".join(refs))

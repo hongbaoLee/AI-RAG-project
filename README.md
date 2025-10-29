@@ -14,3 +14,6 @@ assistan.py 基于streamlit开发的支持opensssl的用户问答客户端，文
 Enterprise_RAG_query_GPT.py ChatGPT辅助生成的企业RAG知识库查询系统，可以将word文档、excel表格、含图表的PDF文档内容向量化以后存入ChromaDB，通过Qwen-max模型提供知识库检索功能。员工可查询公司的规章制度。
 
 主要可用文件：Enterprise_RAG_query_GPT.py
+
+2025.10.29
+增加了langchain开头的几个文件，用于langchain的学习，重点学习LangChain chains，Langchain Agent和Tools的构建
